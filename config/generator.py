@@ -34,15 +34,45 @@ def clean_and_escape(text):
     text = text.replace("&amp;bull;", "&bull;").replace("&amp;middot;", "&middot;")
     return text
 
+import logging
+logger = logging.getLogger("OpenCodeAPI")
+
+def validate_resume_text(text):
+    """
+    Validates that the resume text contains only professional content and absolutely
+    no internal error strings, tracebacks, exception text, or system fallback signs.
+    """
+    if not text:
+        raise ValueError("Resume content is empty.")
+    
+    # List of prohibited substrings (case insensitive)
+    prohibited = [
+        "system fallback",
+        "connection failure",
+        "api error",
+        "traceback",
+        "exception",
+        "expecting value",
+        "parsing error",
+        "json parsing",
+        "stack trace",
+        "error:",
+        "internal error",
+        "status code",
+        "server error",
+        "quickcv"
+    ]
+    
+    lower_text = text.lower()
+    for pattern in prohibited:
+        if pattern in lower_text:
+            raise ValueError(f"Validation failed: Resume text contains prohibited system/error pattern '{pattern}'")
+
 def call_opencode_api(user_data, model_id):
     """
     Calls the OpenCode API utilizing the active selected model
     to generate an elegant, ATS-friendly professional resume based on user provided data.
     """
-    if not OPENCODE_API_KEY:
-        # Fallback raw builder if no API key is set
-        return generate_static_resume_text(user_data)
-
     system_prompt = (
         "You are an elite, professional CV writer and HR recruiter specializing in ATS-friendly formatting, "
         "professional typography, and high-impact industry verbiage. "
@@ -59,7 +89,9 @@ def call_opencode_api(user_data, model_id):
         "\n## Certifications\n[CERTIFICATIONS_LIST]"
         "\n## Languages\n[LANGUAGES_LIST]"
         "\n## Hobbies & Interests\n[HOBBIES_LIST]"
-        "Formatting instructions: Expand everything to look impressive. Format lists beautifully with bullet points."
+        "Formatting instructions: Expand everything to look impressive. Format lists beautifully with bullet points. "
+        "CRITICAL: Do NOT mention any system fallback, API keys, error logs, or software names like QuickCV. "
+        "Export must be completely professional, clean, and contain only resume data."
     )
 
     prompt = (
@@ -78,6 +110,49 @@ def call_opencode_api(user_data, model_id):
         f"Hobbies & Interests: {user_data.get('hobbies')}\n"
     )
 
+    profession = user_data.get('profession', '')
+    is_developer = False
+    if profession in ["Mobile App Developer Resume", "Website Developer Resume", "Full Stack Developer Resume"] or "developer" in profession.lower():
+        is_developer = True
+
+    if is_developer:
+        dev_skills = (
+            "Technical Skills:\n"
+            "- HTML\n"
+            "- CSS\n"
+            "- JavaScript\n"
+            "- Python\n"
+            "- Flutter\n"
+            "- React\n"
+            "- Firebase\n"
+            "- API Integration\n"
+            "- UI/UX Design\n"
+            "- Database Management"
+        )
+        dev_projects = (
+            "Projects:\n"
+            "- Mobile Application Development\n"
+            "- Website Development\n"
+            "- Telegram Bot Development\n"
+            "- AI Tools Integration"
+        )
+        system_prompt += (
+            f"\n\nCRITICAL SPEC: This is a Developer resume. You MUST include these exactly in the resume content:\n"
+            f"{dev_skills}\n"
+            f"{dev_projects}\n"
+        )
+        prompt += (
+            f"\nNote: Ensure the exact technical skills and key projects are seamlessly woven into their respective professional sections."
+        )
+
+    if not OPENCODE_API_KEY:
+        logger.warning("No API key configured. Generating static candidate resume.")
+        u_data = user_data.copy()
+        if is_developer:
+            u_data["skills"] = (u_data.get("skills", "") + "\nHTML, CSS, JavaScript, Python, Flutter, React, Firebase, API Integration, UI/UX Design, Database Management").strip()
+            u_data["projects"] = (u_data.get("projects", "") + "\nMobile Application Development, Website Development, Telegram Bot Development, AI Tools Integration").strip()
+        return generate_static_resume_text(u_data)
+
     headers = {
         "Authorization": f"Bearer {OPENCODE_API_KEY}",
         "Content-Type": "application/json"
@@ -91,25 +166,37 @@ def call_opencode_api(user_data, model_id):
         "temperature": 0.3
     }
 
-    try:
-        response = requests.post(OPENCODE_API_URL, json=payload, headers=headers, timeout=60)
-        if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
-        else:
-            # Fallback
-            return generate_static_resume_text(user_data, f"API Error: Status {response.status_code}")
-    except Exception as e:
-        return generate_static_resume_text(user_data, f"Connection Failure: {str(e)}")
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"AI Generation attempt {attempt}/{max_retries}...")
+            response = requests.post(OPENCODE_API_URL, json=payload, headers=headers, timeout=60)
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                # Verify that content is professional and doesn't contain errors
+                try:
+                    validate_resume_text(content)
+                    return content
+                except Exception as val_err:
+                    logger.warning(f"Attempt {attempt} content validation failed: {val_err}")
+            else:
+                logger.error(f"Attempt {attempt} failed with status {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.error(f"Attempt {attempt} encountered exception: {e}", exc_info=True)
+
+    # If all 3 attempts fail, raise RuntimeError
+    raise RuntimeError("AI generation temporarily unavailable. Please try again.")
 
 def generate_static_resume_text(u, fallback_msg=""):
     """
     Simple fallback text compilation if the AI provider cannot be resolved.
     """
-    text = f"# {u.get('name', 'QuickCV User')}\n"
+    text = f"# {u.get('name', 'Professional Candidate')}\n"
     text += f"Contact: {u.get('phone')} | {u.get('email')} | {u.get('address')}\n\n"
+    # Fallback message is logged but never injected into actual resume text
     if fallback_msg:
-        text += f"*Generated with System Fallback* — {fallback_msg}\n\n"
+         logger.warning(f"Static fallback triggered with: {fallback_msg}")
     text += f"## Career Objective\n{u.get('objective', 'To excel in a challenging environment.')}\n\n"
     text += f"## Technical & Professional Skills\n{u.get('skills', '').replace(',', ', ')}\n\n"
     text += f"## Work Experience\n{u.get('experience', '')}\n\n"
@@ -119,6 +206,7 @@ def generate_static_resume_text(u, fallback_msg=""):
     text += f"## Languages\n{u.get('languages', '')}\n\n"
     text += f"## Hobbies\n{u.get('hobbies', '')}\n"
     return text
+
 
 def parse_markdown_to_sections(text):
     """
@@ -182,6 +270,9 @@ def create_resume_files(user_id, resume_text, unique_id):
     Stores files in /generated_resumes/ using unique identifiers.
     Returns (pdf_path, docx_path) filenames.
     """
+    # Strict validation before creating files
+    validate_resume_text(resume_text)
+    
     parsed = parse_markdown_to_sections(resume_text)
     
     pdf_filename = f"resume_{user_id}_{unique_id}.pdf"
@@ -303,7 +394,7 @@ def create_resume_files(user_id, resume_text, unique_id):
         try:
             doc = SimpleDocTemplate(pdf_path, pagesize=letter)
             styles = getSampleStyleSheet()
-            story = [Paragraph("QuickCV Document Generation Fallback", styles['Heading1'])]
+            story = [Paragraph("Professional Resume", styles['Heading1'])]
             for line in resume_text.split("\n"):
                 story.append(Paragraph(clean_and_escape(line), styles['Normal']))
             doc.build(story)

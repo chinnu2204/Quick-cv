@@ -19,6 +19,7 @@ router = Router()
 db = DBManager()
 
 class ResumeFlow(StatesGroup):
+    profession = State()
     full_name = State()
     phone_number = State()
     email = State()
@@ -332,10 +333,66 @@ async def start_resume_flow(message: Message, state: FSMContext):
         )
         return
 
-    await state.set_state(ResumeFlow.full_name)
+    await state.set_state(ResumeFlow.profession)
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Resume Builder", callback_data="prof_builder")],
+        [InlineKeyboardButton(text="📱 Mobile App Developer Resume", callback_data="prof_mobile")],
+        [InlineKeyboardButton(text="💻 Website Developer Resume", callback_data="prof_web")],
+        [InlineKeyboardButton(text="🌐 Full Stack Developer Resume", callback_data="prof_fullstack")],
+        [InlineKeyboardButton(text="🛡️ Security Guard Resume", callback_data="prof_security")],
+        [InlineKeyboardButton(text="🧹 Housekeeping Resume", callback_data="prof_housekeeping")],
+        [InlineKeyboardButton(text="🤖 Custom AI Resume", callback_data="prof_custom")],
+        [InlineKeyboardButton(text="❌ Cancel & Exit", callback_data="cancel_creation")]
+    ])
+    
     await message.answer(
-        "📝 **Initiating CV Wizard!**\n\nLet's build you a highly polished resume. "
-        "Type /cancel at any time to abort.\n\n"
+        "📝 **QuickCV Profession Selection**\n\n"
+        "Please select a profession/template style to begin tailoring your resume:\n\n"
+        "1. **Resume Builder** (Standard Custom)\n"
+        "2. **Mobile App Developer Resume** (Pre-optimized)\n"
+        "3. **Website Developer Resume** (Pre-optimized)\n"
+        "4. **Full Stack Developer Resume** (Pre-optimized)\n"
+        "5. **Security Guard Resume** (Tailored layout)\n"
+        "6. **Housekeeping Resume** (Tailored layout)\n"
+        "7. **Custom AI Resume** (Describe custom role)",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+
+@router.callback_query(ResumeFlow.profession, F.data.startswith("prof_"))
+async def process_profession_callback(callback: CallbackQuery, state: FSMContext):
+    choice = callback.data
+    
+    prof_map = {
+        "prof_builder": "Resume Builder",
+        "prof_mobile": "Mobile App Developer Resume",
+        "prof_web": "Website Developer Resume",
+        "prof_fullstack": "Full Stack Developer Resume",
+        "prof_security": "Security Guard Resume",
+        "prof_housekeeping": "Housekeeping Resume",
+        "prof_custom": "Custom AI Resume"
+    }
+    
+    profession_name = prof_map.get(choice, "Resume Builder")
+    await state.update_data(profession=profession_name)
+    
+    await callback.answer(f"Selected: {profession_name}")
+    await callback.message.edit_text(
+        f"🎯 **Profession Selected:** {profession_name}\n\n"
+        "Initializing template parameters..."
+    )
+    
+    is_developer = choice in ["prof_mobile", "prof_web", "prof_fullstack"]
+    if is_developer:
+        await callback.message.answer(
+            "⚡ **Developer Template Active!**\n"
+            "Your technical skills & project details will be automatically populated with professional "
+            "industry standards (React, Flutter, Firebase, etc.). We will skip those questions to optimize your time."
+        )
+        
+    await state.set_state(ResumeFlow.full_name)
+    await callback.message.answer(
         "🔹 **Question 1:** What is your **Full Name**?",
         reply_markup=get_cancel_markup(),
         parse_mode="Markdown"
@@ -392,12 +449,28 @@ async def state_objective(message: Message, state: FSMContext):
         await message.reply("Please enter a short professional summary or career objective (minimum 10 characters).")
         return
     await state.update_data(objective=message.text.strip())
-    await state.set_state(ResumeFlow.skills)
-    await message.answer(
-        "🔹 **Question 6:** Enter your key **Professional & Tech Skills** (comma-separated if possible):\n\n"
-        "Example: *Python, Django, AWS, React, Agile, SQL*",
-        reply_markup=get_cancel_markup()
-    )
+    
+    # Check if this is a developer template
+    data = await state.get_data()
+    profession = data.get("profession", "")
+    is_developer = profession in ["Mobile App Developer Resume", "Website Developer Resume", "Full Stack Developer Resume"]
+    
+    if is_developer:
+        dev_skills = "HTML, CSS, JavaScript, Python, Flutter, React, Firebase, API Integration, UI/UX Design, Database Management"
+        await state.update_data(skills=dev_skills)
+        await state.set_state(ResumeFlow.education)
+        await message.answer(
+            "🔹 **Question 6:** Detail your **Education Profile** (Degrees, Institutions, Completion dates):\n\n"
+            "Example: *B.Sc. in Computer Science - Boston University (2018 - 2022)*",
+            reply_markup=get_cancel_markup()
+        )
+    else:
+        await state.set_state(ResumeFlow.skills)
+        await message.answer(
+            "🔹 **Question 6:** Enter your key **Professional & Tech Skills** (comma-separated if possible):\n\n"
+            "Example: *Python, Django, AWS, React, Agile, SQL*",
+            reply_markup=get_cancel_markup()
+        )
 
 @router.message(ResumeFlow.skills)
 async def state_skills(message: Message, state: FSMContext):
@@ -420,9 +493,15 @@ async def state_education(message: Message, state: FSMContext):
         await message.reply("Please provide valid education history.")
         return
     await state.update_data(education=message.text.strip())
+    
+    data = await state.get_data()
+    profession = data.get("profession", "")
+    is_developer = profession in ["Mobile App Developer Resume", "Website Developer Resume", "Full Stack Developer Resume"]
+    
+    q_num = "7" if is_developer else "8"
     await state.set_state(ResumeFlow.experience)
     await message.answer(
-        "🔹 **Question 8:** Detail your **Professional Work Experience** (Companies, Roles, and key Achievements):\n\n"
+        f"🔹 **Question {q_num}:** Detail your **Professional Work Experience** (Companies, Roles, and key Achievements):\n\n"
         "Example: *Senior Frontend Developer at Tech Corp (2022 - Present) - Lead team of 4 engineers...*",
         reply_markup=get_cancel_markup()
     )
@@ -434,12 +513,27 @@ async def state_experience(message: Message, state: FSMContext):
         await message.reply("Please fill in some work experience.")
         return
     await state.update_data(experience=message.text.strip())
-    await state.set_state(ResumeFlow.projects)
-    await message.answer(
-        "🔹 **Question 9:** Outline your notable **Key Projects** (Title and short description):\n\n"
-        "Example: *E-commerce App: Built a full stack shop using Next.js processing $20k monthly transactions...*",
-        reply_markup=get_cancel_markup()
-    )
+    
+    data = await state.get_data()
+    profession = data.get("profession", "")
+    is_developer = profession in ["Mobile App Developer Resume", "Website Developer Resume", "Full Stack Developer Resume"]
+    
+    if is_developer:
+        dev_projects = "Projects:\n- Mobile Application Development\n- Website Development\n- Telegram Bot Development\n- AI Tools Integration"
+        await state.update_data(projects=dev_projects)
+        await state.set_state(ResumeFlow.certifications)
+        await message.answer(
+            "🔹 **Question 8:** What **Professional Certifications** do you possess?\n\n"
+            "Example: *AWS Certified Solutions Architect, Scrum Alliance Scrum Master*",
+            reply_markup=get_cancel_markup()
+        )
+    else:
+        await state.set_state(ResumeFlow.projects)
+        await message.answer(
+            "🔹 **Question 9:** Outline your notable **Key Projects** (Title and short description):\n\n"
+            "Example: *E-commerce App: Built a full stack shop using Next.js processing $20k monthly transactions...*",
+            reply_markup=get_cancel_markup()
+        )
 
 @router.message(ResumeFlow.projects)
 async def state_projects(message: Message, state: FSMContext):
@@ -462,9 +556,15 @@ async def state_certifications(message: Message, state: FSMContext):
          await message.reply("Please input certifications, or type 'None'.")
          return
     await state.update_data(certifications=message.text.strip())
+    
+    data = await state.get_data()
+    profession = data.get("profession", "")
+    is_developer = profession in ["Mobile App Developer Resume", "Website Developer Resume", "Full Stack Developer Resume"]
+    
+    q_num = "9" if is_developer else "11"
     await state.set_state(ResumeFlow.languages)
     await message.answer(
-        "🔹 **Question 11:** What **Languages** do you speak?\n\n"
+        f"🔹 **Question {q_num}:** What **Languages** do you speak?\n\n"
         "Example: *English (Native), German (Fluent), Spanish (Basic)*",
         reply_markup=get_cancel_markup()
     )
@@ -476,9 +576,15 @@ async def state_languages(message: Message, state: FSMContext):
         await message.reply("Please specify languages.")
         return
     await state.update_data(languages=message.text.strip())
+    
+    data = await state.get_data()
+    profession = data.get("profession", "")
+    is_developer = profession in ["Mobile App Developer Resume", "Website Developer Resume", "Full Stack Developer Resume"]
+    
+    q_num = "10" if is_developer else "12"
     await state.set_state(ResumeFlow.hobbies)
     await message.answer(
-        "🔹 **Question 12:** Mention any other **Hobbies or Personal Interests**:",
+        f"🔹 **Question {q_num}:** Mention any other **Hobbies or Personal Interests**:",
         reply_markup=get_cancel_markup()
     )
 
@@ -525,7 +631,7 @@ async def state_hobbies(message: Message, state: FSMContext):
             await status_msg.delete()
         except:
             pass
-        await message.answer("❌ **Resume generation failed.** No credits were consumed. Please try again.", reply_markup=get_main_keyboard())
+        await message.answer("⚠️ AI generation temporarily unavailable. Please try again.", reply_markup=get_main_keyboard())
         return
         
     pdf_full = os.path.join(RESUMES_DIR, pdf_file)
@@ -536,7 +642,7 @@ async def state_hobbies(message: Message, state: FSMContext):
             await status_msg.delete()
         except:
             pass
-        await message.answer("❌ **Template compilation failed.** No credits were consumed. Please try again.", reply_markup=get_main_keyboard())
+        await message.answer("⚠️ AI generation temporarily unavailable. Please try again.", reply_markup=get_main_keyboard())
         return
 
     # Success! Deduct 1 credit safely now
