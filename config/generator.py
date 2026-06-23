@@ -68,6 +68,53 @@ def validate_resume_text(text):
         if pattern in lower_text:
             raise ValueError(f"Validation failed: Resume text contains prohibited system/error pattern '{pattern}'")
 
+def call_opencode_api_generic(prompt, system_prompt, model_id=None):
+    """
+    Calls the OpenCode API with a generic prompt and system prompt.
+    If no API key is set, returns an elegant static dummy mock content centered on the prompt.
+    """
+    if not model_id:
+        model_id = "meta-llama/Llama-3-8b-instruct" # Fallback model
+    
+    if not OPENCODE_API_KEY:
+        logger.warning("No API key configured for generic call. Using descriptive static fallback.")
+        return f"Static Mock Response:\nYour request to build '{prompt[:50]}' was processed successfully. " \
+               f"Please configure OPENCODE_API_KEY in settings to generate high-performance production-ready AI results."
+
+    headers = {
+        "Authorization": f"Bearer {OPENCODE_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.4
+    }
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"AI Generic Generation attempt {attempt}/{max_retries}...")
+            response = requests.post(OPENCODE_API_URL, json=payload, headers=headers, timeout=60)
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                # Verify that content is clean and doesn't contain errors
+                try:
+                    validate_resume_text(content)
+                    return content
+                except Exception as val_err:
+                    logger.warning(f"Attempt {attempt} generic content validation failed: {val_err}")
+            else:
+                logger.error(f"Attempt {attempt} generic failed: {response.text}")
+        except Exception as e:
+            logger.error(f"Attempt {attempt} generic exception: {e}", exc_info=True)
+
+    raise RuntimeError("AI generation temporarily unavailable. Please try again.")
+
 def call_opencode_api(user_data, model_id):
     """
     Calls the OpenCode API utilizing the active selected model

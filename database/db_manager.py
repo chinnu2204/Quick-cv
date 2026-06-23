@@ -141,6 +141,19 @@ class DBManager:
                     banned_at TEXT
                 )
             """)
+
+            # 9. Projects Table (for Website, App, Code, Design, Document, etc.)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS projects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    title TEXT,
+                    category TEXT,
+                    sub_category TEXT,
+                    content TEXT,
+                    created_at TEXT
+                )
+            """)
             
             # Column-level self-healing migrations
             try:
@@ -455,6 +468,33 @@ class DBManager:
         def _get(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM resumes WHERE user_id = ? ORDER BY id DESC", (user_id,))
+            return [dict(row) for row in cursor.fetchall()]
+        return self._run_with_retry(_get)
+
+    # --- PROJECT REGISTRY (Website, App, Code, Design, Document, etc.) ---
+    def save_project(self, user_id, title, category, sub_category, content):
+        now = datetime.datetime.now().isoformat()
+        def _save(conn):
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO projects (user_id, title, category, sub_category, content, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, title, category, sub_category, content, now)
+            )
+            last_id = cursor.lastrowid
+            try:
+                self.add_log("INFO", "PROJECT_SAVED", f"Saved project: {title} in category: {category} ({sub_category})", user_id, conn=conn)
+            except Exception:
+                pass
+            return last_id
+        return self._run_with_retry(_save)
+
+    def get_user_projects(self, user_id, category=None):
+        def _get(conn):
+            cursor = conn.cursor()
+            if category:
+                cursor.execute("SELECT * FROM projects WHERE user_id = ? AND category = ? ORDER BY id DESC", (user_id, category))
+            else:
+                cursor.execute("SELECT * FROM projects WHERE user_id = ? ORDER BY id DESC", (user_id,))
             return [dict(row) for row in cursor.fetchall()]
         return self._run_with_retry(_get)
 
