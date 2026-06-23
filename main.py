@@ -24,7 +24,10 @@ logger = logging.getLogger("QuickCVMain")
 
 # 1. Initialize SQLite Database
 db = DBManager()
-db.add_log("INFO", "SYSTEM_STARTUP", "QuickCV Multi-Bot Orchestrator boot cycle started.")
+try:
+    db.add_log("INFO", "SYSTEM_STARTUP", "QuickCV Multi-Bot Orchestrator boot cycle started.")
+except Exception as db_err:
+    logger.warning(f"Database logging on boot skipped: {db_err}")
 
 # 2. Setup Health Check Web Server
 async def handle_ping_request(request):
@@ -41,7 +44,7 @@ async def handle_ping_request(request):
         "</head>"
         "<body>"
         "<h1>⚡ QuickCV Telegram SaaS</h1>"
-        "<p>All 3 automated bots are actively running in production long-polling mode.</p>"
+        "<p>All automated bots are actively running in production long-polling mode.</p>"
         "<div class='badge'>User Bot Router | Admin Bot Console | Credit Monitor</div>"
         "</body>"
         "</html>"
@@ -56,95 +59,146 @@ def init_web_app():
 
 # 3. Main Multi-Bot Coroutine Orchestrator
 async def main():
-    runners = []
+    logger.info("Initializing multi-bot de-duplicated orchestrator...")
     
-    # Track which bots initialized successfully
-    initialized_bots = []
+    # Track polling status to prevent duplicate loops
+    polling_tasks = []
     
-    # Dispatcher instances
-    user_dp = Dispatcher()
-    admin_dp = Dispatcher()
-    credit_dp = Dispatcher()
+    # Clean and parse tokens
+    placeholders = {
+        "your_user_bot_token_here",
+        "your_admin_bot_token_here",
+        "your_credit_bot_token_here",
+        "",
+        None
+    }
     
-    # Register blueprints (routers)
-    user_dp.include_router(user_bot_module.router)
-    admin_dp.include_router(admin_bot_module.router)
-    credit_dp.include_router(credit_bot_module.router)
-
-    # Validate and initialize User Bot
+    tokens_map = {
+        "UserBot": (USER_BOT_TOKEN or "").strip(),
+        "AdminBot": (ADMIN_BOT_TOKEN or "").strip(),
+        "CreditBot": (CREDIT_BOT_TOKEN or "").strip(),
+    }
+    
+    # De-duplicate tokens so we compile bots sharing the same token into a single loop
+    token_to_roles = {}
+    for bot_role, token_val in tokens_map.items():
+        if token_val and token_val not in placeholders:
+            if token_val not in token_to_roles:
+                token_to_roles[token_val] = []
+            token_to_roles[token_val].append(bot_role)
+            
+    # Resolve active Bot clients
+    bot_clients = {}
     user_bot_instance = None
-    if USER_BOT_TOKEN and USER_BOT_TOKEN != "your_user_bot_token_here":
-        try:
-            user_bot_instance = Bot(token=USER_BOT_TOKEN)
-            # Inject dependency into static references
-            admin_bot_module.user_bot_shared = user_bot_instance
-            
-            async def start_user_polling():
-                logger.info("Starting QuickCV User Bot polling loop...")
-                while True:
-                    try:
-                        await user_dp.start_polling(user_bot_instance)
-                    except Exception as err:
-                        logger.error(f"User Bot polling encountered an error: {err}. Re-establishing in 10s...")
-                        await asyncio.sleep(10)
-            runners.append(start_user_polling)
-            initialized_bots.append("UserBot (Active)")
-        except Exception as e:
-            logger.error(f"Failed to load User Bot instance: {str(e)}")
-    else:
-        logger.warning("USER_BOT_TOKEN environment variable not set or contains default placeholder.")
-
-    # Validate and initialize Admin Bot
     admin_bot_instance = None
-    if ADMIN_BOT_TOKEN and ADMIN_BOT_TOKEN != "your_admin_bot_token_here":
-        try:
-            admin_bot_instance = Bot(token=ADMIN_BOT_TOKEN)
-            async def start_admin_polling():
-                logger.info("Starting QuickCV Admin Panel Bot polling loop...")
-                while True:
-                    try:
-                        await admin_dp.start_polling(admin_bot_instance)
-                    except Exception as err:
-                        logger.error(f"Admin Bot polling encountered an error: {err}. Re-establishing in 10s...")
-                        await asyncio.sleep(10)
-            runners.append(start_admin_polling)
-            initialized_bots.append("AdminBot (Active)")
-        except Exception as e:
-            logger.error(f"Failed to load Admin Bot instance: {str(e)}")
-    else:
-        logger.warning("ADMIN_BOT_TOKEN environment variable not set or contains default placeholder.")
-
-    # Validate and initialize Credit Bot
     credit_bot_instance = None
-    if CREDIT_BOT_TOKEN and CREDIT_BOT_TOKEN != "your_credit_bot_token_here":
+    
+    for token, roles in token_to_roles.items():
         try:
-            credit_bot_instance = Bot(token=CREDIT_BOT_TOKEN)
-            # Inject dependency references so the other modules can message notification alerts
-            user_bot_module.credit_bot_shared = credit_bot_instance
-            admin_bot_module.credit_bot_shared = credit_bot_instance
+            bot_client = Bot(token=token)
+            me = await bot_client.get_me()
             
-            async def start_credit_polling():
-                logger.info("Starting QuickCV Credit & Notification Bot polling loop...")
+            # Print beautiful metadata report
+            logger.info("================================================")
+            logger.info(f"Bot Name     : {me.full_name}")
+            logger.info(f"Bot ID       : {me.id}")
+            logger.info(f"Token Status : Valid & Active")
+            logger.info(f"Roles Assigned: {', '.join(roles)}")
+            logger.info(f"Polling Status: Initializing")
+            logger.info("================================================")
+            
+            # Save client references for internal cross-bot communication
+            for r in roles:
+                bot_clients[r] = bot_client
+                
+        except Exception as e:
+            logger.critical(f"FATAL: Token validation failed for roles {roles}: {e}")
+            
+    # Map static instances and fallbacks
+    user_bot_instance = bot_clients.get("UserBot")
+    admin_bot_instance = bot_clients.get("AdminBot")
+    credit_bot_instance = bot_clients.get("CreditBot")
+    
+    # Inject references safely so modules can cross-communicate
+    if admin_bot_instance:
+        admin_bot_module.user_bot_shared = user_bot_instance or admin_bot_instance
+    if user_bot_instance:
+        user_bot_module.credit_bot_shared = credit_bot_instance or user_bot_instance
+    if admin_bot_instance:
+        admin_bot_module.credit_bot_shared = credit_bot_instance or admin_bot_instance
+
+    # Create dedicated polling instances per unique token
+    initialized_services_logs = []
+    
+    for token, roles in token_to_roles.items():
+        # Get primary bot client for this token
+        representative_role = roles[0]
+        bot_client = bot_clients.get(representative_role)
+        if not bot_client:
+            continue
+            
+        # Create dedicated Dispatcher for this loop
+        dp = Dispatcher()
+        routers_found = []
+        
+        # Include corresponding routers for all assigned roles sharing this token
+        if "UserBot" in roles:
+            dp.include_router(user_bot_module.router)
+            routers_found.append("User Router")
+        if "AdminBot" in roles:
+            dp.include_router(admin_bot_module.router)
+            routers_found.append("Admin Router")
+        if "CreditBot" in roles:
+            dp.include_router(credit_bot_module.router)
+            routers_found.append("Credit Router")
+            
+        initialized_services_logs.append(f"{'/'.join(roles)} (Enabled)")
+        
+        # Define clean separate running task to capture variables correctly
+        def make_polling_coro(b_client, b_dp, b_roles, r_list):
+            async def run_bot_polling():
+                b_name = "Unknown"
+                try:
+                    me_info = await b_client.get_me()
+                    b_name = me_info.full_name
+                except Exception:
+                    pass
+                
+                logger.info(f"Starting boot routine for bot: '{b_name}' ({'/'.join(b_roles)}).")
+                
+                # Infinite loop to manage reconnection + automatic recovery
                 while True:
                     try:
-                        await credit_dp.start_polling(credit_bot_instance)
+                        logger.info(f"Flushing previous webhook session for bot: '{b_name}'...")
+                        await b_client.delete_webhook(drop_pending_updates=True)
+                        logger.info(f"Cleared webhooks! Starting aiogram polling for bot: '{b_name}' on routers: {', '.join(r_list)}")
+                        
+                        # Start polling and monitor
+                        logger.info(f"Polling Status: Active for '{b_name}' ({'/'.join(b_roles)})")
+                        await b_dp.start_polling(b_client, skip_updates=True)
+                        
                     except Exception as err:
-                        logger.error(f"Credit Bot polling encountered an error: {err}. Re-establishing in 10s...")
+                        logger.error(f"Polling connection dropped or conflict for bot '{b_name}': {err}.")
+                        logger.info("Polling Status: Reconnecting in 10s...")
                         await asyncio.sleep(10)
-            runners.append(start_credit_polling)
-            initialized_bots.append("CreditBot (Active)")
-        except Exception as e:
-            logger.error(f"Failed to load Credit Bot instance: {str(e)}")
-    else:
-        logger.warning("CREDIT_BOT_TOKEN environment variable not set or contains default placeholder.")
+            return run_bot_polling
+            
+        polling_tasks.append(make_polling_coro(bot_client, dp, roles, routers_found))
 
-    # Log operational report
-    if initialized_bots:
-        logger.info(f"System loaded successfully with active services: {', '.join(initialized_bots)}")
-        db.add_log("INFO", "SERVICES_STARTED", f"Running: {', '.join(initialized_bots)}")
+    # Log general startup
+    if initialized_services_logs:
+        status_msg = f"De-duplicated service pool initialized: {', '.join(initialized_services_logs)}"
+        logger.info(status_msg)
+        try:
+            db.add_log("INFO", "SERVICES_STARTED", status_msg)
+        except Exception:
+            pass
     else:
-        logger.warning("No Telegram bots were loaded. To activate, specify token variables in your environment or .env file.")
-        db.add_log("WARNING", "NO_SERVICES_STARTED", "No bots loaded. Enter tokens in secrets config to use.")
+        logger.warning("No valid bot services launched. Ensure your tokens env is set correctly.")
+        try:
+            db.add_log("WARNING", "NO_SERVICES_STARTED", "No valid bot tokens provided. System idling.")
+        except Exception:
+            pass
 
     # Start Health keep-alive web-server inside local event loop
     app = init_web_app()
@@ -152,22 +206,21 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Port health listener initialized successfully on port {PORT}.")
+    logger.info(f"Production web health-check server listening actively on port {PORT}.")
 
-    # Launch bots in background tasks
+    # Launch bots in background tasks (only 1 target per unique token)
     launched_tasks = []
-    for task in runners:
-        launched_tasks.append(asyncio.create_task(task()))
+    for poller in polling_tasks:
+        launched_tasks.append(asyncio.create_task(poller()))
 
-    logger.info("All initialized background bot tasks launched.")
+    logger.info(f"All {len(launched_tasks)} de-duplicated active bot loops successfully launched.")
 
-    # Keep the main loop alive forever so webserver and bots stay up
+    # Keep container open and monitor tasks
     try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
-        logger.info("Main worker canceled.")
-        # Clean up background tasks
+        logger.info("Main system orchestrator caught cancellation. Shutting down tasks gracefully...")
         for t in launched_tasks:
             t.cancel()
 
@@ -175,4 +228,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("QuickCV runner shutdown finished.")
+        logger.info("QuickCV services shutdown completed safely.")
