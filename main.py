@@ -80,8 +80,13 @@ async def main():
             admin_bot_module.user_bot_shared = user_bot_instance
             
             async def start_user_polling():
-                logger.info("Starting QuickCV User Bot polling...")
-                await user_dp.start_polling(user_bot_instance)
+                logger.info("Starting QuickCV User Bot polling loop...")
+                while True:
+                    try:
+                        await user_dp.start_polling(user_bot_instance)
+                    except Exception as err:
+                        logger.error(f"User Bot polling encountered an error: {err}. Re-establishing in 10s...")
+                        await asyncio.sleep(10)
             runners.append(start_user_polling)
             initialized_bots.append("UserBot (Active)")
         except Exception as e:
@@ -95,8 +100,13 @@ async def main():
         try:
             admin_bot_instance = Bot(token=ADMIN_BOT_TOKEN)
             async def start_admin_polling():
-                logger.info("Starting QuickCV Admin Panel Bot polling...")
-                await admin_dp.start_polling(admin_bot_instance)
+                logger.info("Starting QuickCV Admin Panel Bot polling loop...")
+                while True:
+                    try:
+                        await admin_dp.start_polling(admin_bot_instance)
+                    except Exception as err:
+                        logger.error(f"Admin Bot polling encountered an error: {err}. Re-establishing in 10s...")
+                        await asyncio.sleep(10)
             runners.append(start_admin_polling)
             initialized_bots.append("AdminBot (Active)")
         except Exception as e:
@@ -114,8 +124,13 @@ async def main():
             admin_bot_module.credit_bot_shared = credit_bot_instance
             
             async def start_credit_polling():
-                logger.info("Starting QuickCV Credit & Notification Bot polling...")
-                await credit_dp.start_polling(credit_bot_instance)
+                logger.info("Starting QuickCV Credit & Notification Bot polling loop...")
+                while True:
+                    try:
+                        await credit_dp.start_polling(credit_bot_instance)
+                    except Exception as err:
+                        logger.error(f"Credit Bot polling encountered an error: {err}. Re-establishing in 10s...")
+                        await asyncio.sleep(10)
             runners.append(start_credit_polling)
             initialized_bots.append("CreditBot (Active)")
         except Exception as e:
@@ -139,19 +154,22 @@ async def main():
     await site.start()
     logger.info(f"Port health listener initialized successfully on port {PORT}.")
 
-    # Gather background tasks
-    if runners:
-        try:
-            await asyncio.gather(*[task() for task in runners])
-        except asyncio.CancelledError:
-            logger.info("Background processes canceled.")
-        except Exception as e:
-            logger.error(f"Critical service error occurred during runtime: {e}")
-    else:
-        # Prevent exit if no bots started, keep container open
-        logger.warning("All services idle. Waiting for credentials formulation...")
+    # Launch bots in background tasks
+    launched_tasks = []
+    for task in runners:
+        launched_tasks.append(asyncio.create_task(task()))
+
+    logger.info("All initialized background bot tasks launched.")
+
+    # Keep the main loop alive forever so webserver and bots stay up
+    try:
         while True:
             await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        logger.info("Main worker canceled.")
+        # Clean up background tasks
+        for t in launched_tasks:
+            t.cancel()
 
 if __name__ == "__main__":
     try:

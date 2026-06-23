@@ -2,6 +2,8 @@ import sqlite3
 import datetime
 import uuid
 import json
+import time
+import sys
 from config.settings import DB_PATH, ADMIN_IDS, DEFAULT_MODEL_ID, SUPPORTED_MODELS
 
 class DBManager:
@@ -10,16 +12,47 @@ class DBManager:
         self._init_db()
 
     def _get_connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=30,
+            check_same_thread=False
+        )
         conn.row_factory = sqlite3.Row
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
-        except:
-            pass
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+        except Exception as e:
+            print(f"Warning: Failed to set PRAGMAs: {e}", file=sys.stderr)
         return conn
 
+    def _run_with_retry(self, action_func, *args, **kwargs):
+        """
+        Runs action_func (which takes a connection as its first argument) under retry logic
+        specifically catching sqlite3.OperationalError: database is locked.
+        """
+        delay_times = [0.2, 0.5, 1.0, 2.0, 5.0]
+        max_retries = len(delay_times)
+        
+        for attempt in range(max_retries + 1):
+            conn = self._get_connection()
+            try:
+                with conn:
+                    result = action_func(conn, *args, **kwargs)
+                return result
+            except sqlite3.OperationalError as e:
+                err_msg = str(e).lower()
+                if "locked" in err_msg or "busy" in err_msg:
+                    if attempt < max_retries:
+                        sleep_time = delay_times[attempt]
+                        time.sleep(sleep_time)
+                        continue
+                raise e
+            finally:
+                conn.close()
+
     def _init_db(self):
-        with self._get_connection() as conn:
+        def _init(conn):
             cursor = conn.cursor()
             
             # 1. Users Table
@@ -119,13 +152,13 @@ class DBManager:
             except sqlite3.OperationalError:
                 pass
             
-            conn.commit()
+        self._run_with_retry(_init)
 
         # Seed initial models and settings
         self.seed_defaults()
 
     def seed_defaults(self):
-        with self._get_connection() as conn:
+        def _seed(conn):
             cursor = conn.cursor()
             
             # Seed default active model
@@ -144,27 +177,41 @@ class DBManager:
             for admin_id in ADMIN_IDS:
                 cursor.execute("INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)", (admin_id, now))
                 
-            conn.commit()
+        self._run_with_retry(_seed)
 
     # --- LOGS HELPERS ---
-    def add_log(self, level, category, message, user_id=None):
+    def add_log(self, level, category, message, user_id=None, conn=None):
         timestamp = datetime.datetime.now().isoformat()
-        with self._get_connection() as conn:
-            conn.execute(
-                "INSERT INTO logs (timestamp, level, category, message, user_id) VALUES (?, ?, ?, ?, ?)",
-                (timestamp, level, category, message, user_id)
-            )
+        try:
+            if conn is not None:
+                conn.execute(
+                    "INSERT INTO logs (timestamp, level, category, message, user_id) VALUES (?, ?, ?, ?, ?)",
+                    (timestamp, level, category, message, user_id)
+                )
+            else:
+                def _write(c):
+                    c.execute(
+                        "INSERT INTO logs (timestamp, level, category, message, user_id) VALUES (?, ?, ?, ?, ?)",
+                        (timestamp, level, category, message, user_id)
+                    )
+                self._run_with_retry(_write)
+        except Exception as e:
+            # Fix add_log() specifically because it is crashing user registration.
+            # If log insertion fails: Do not crash bot. Print warning and continue.
+            print(f"Warning: Failed to insert log ({level}, {category}, {message}): {e}", file=sys.stderr)
 
     def get_logs(self, limit=100):
-        with self._get_connection() as conn:
+        def _get(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
+        return self._run_with_retry(_get)
 
     # --- USER METHODS ---
     def get_or_create_user(self, user_id, username, first_name, last_name, referred_by=None):
         now = datetime.datetime.now().isoformat()
-        with self._get_connection() as conn:
+        
+        def _get_or_create(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
             user = cursor.fetchone()
@@ -187,7 +234,11 @@ class DBManager:
                 (user_id,)
             )
             
-            self.add_log("INFO", "USER_JOINED", f"New user joined: {first_name} (@{username})", user_id)
+            # Ensure logging failure doesn't crash user creations
+            try:
+                self.add_log("INFO", "USER_JOINED", f"New user joined: {first_name} (@{username})", user_id, conn=conn)
+            except Exception:
+                pass
             
             # Process referral if referee entered code
             if referred_by and referred_by != user_id:
@@ -201,25 +252,29 @@ class DBManager:
                     "UPDATE credits SET balance = balance + 1 WHERE user_id = ?",
                     (referred_by,)
                 )
-                self.add_log("INFO", "REFERRAL_USED", f"User {user_id} registered under {referred_by}. +1 credit to referrer.", referred_by)
+                try:
+                    self.add_log("INFO", "REFERRAL_USED", f"User {user_id} registered under {referred_by}. +1 credit to referrer.", referred_by, conn=conn)
+                except Exception:
+                    pass
                 
-            conn.commit()
-            
             cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
             return dict(cursor.fetchone())
+
+        return self._run_with_retry(_get_or_create)
 
     def get_user_by_referral_code(self, code):
         if not code:
             return None
-        with self._get_connection() as conn:
+        def _get(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM users WHERE referral_code = ?", (code.upper().strip(),))
             row = cursor.fetchone()
             return dict(row) if row else None
+        return self._run_with_retry(_get)
 
     # --- CREDIT SERVICES ---
     def get_credits(self, user_id):
-        with self._get_connection() as conn:
+        def _get_helper(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT balance, last_claimed_reward, unlimited FROM credits WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
@@ -228,22 +283,24 @@ class DBManager:
             else:
                 # Initialize credits structure if missing
                 cursor.execute("INSERT INTO credits (user_id, balance) VALUES (?, 2)", (user_id,))
-                conn.commit()
                 return {"balance": 2, "last_claimed_reward": None, "unlimited": 0}
+        return self._run_with_retry(_get_helper)
 
     def claim_daily_reward(self, user_id):
         now = datetime.datetime.now()
         now_str = now.isoformat()
         
-        with self._get_connection() as conn:
+        def _claim(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT last_claimed_reward, balance FROM credits WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
             
             if not row:
                 cursor.execute("INSERT INTO credits (user_id, balance, last_claimed_reward) VALUES (?, 4, ?)", (user_id, now_str))
-                conn.commit()
-                self.add_log("INFO", "CREDIT_CLAIMED", "Claimed first daily reward (+2 credits)", user_id)
+                try:
+                    self.add_log("INFO", "CREDIT_CLAIMED", "Claimed first daily reward (+2 credits)", user_id, conn=conn)
+                except Exception:
+                    pass
                 return True, "Success! You received 2 Credits.", 24 * 3600
                 
             last_claimed = row["last_claimed_reward"]
@@ -262,19 +319,22 @@ class DBManager:
                 "UPDATE credits SET balance = balance + 2, last_claimed_reward = ? WHERE user_id = ?",
                 (now_str, user_id)
             )
-            conn.commit()
-            self.add_log("INFO", "CREDIT_CLAIMED", "Daily reward claimed (+2 credits)", user_id)
+            try:
+                self.add_log("INFO", "CREDIT_CLAIMED", "Daily reward claimed (+2 credits)", user_id, conn=conn)
+            except Exception:
+                pass
             return True, "Daily Reward Claimed! +2 credits added to your balance.", 24 * 3600
 
+        return self._run_with_retry(_claim)
+
     def consume_credit(self, user_id):
-        with self._get_connection() as conn:
+        def _consume(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT balance, unlimited FROM credits WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
             if not row:
                 # auto provision
                 cursor.execute("INSERT INTO credits (user_id, balance) VALUES (?, 2)", (user_id,))
-                conn.commit()
                 return True
                 
             if row["unlimited"] == 1:
@@ -282,106 +342,136 @@ class DBManager:
                 
             if row["balance"] >= 1:
                 cursor.execute("UPDATE credits SET balance = balance - 1 WHERE user_id = ?", (user_id,))
-                conn.commit()
                 return True
             return False
 
+        return self._run_with_retry(_consume)
+
     def modify_credits(self, user_id, amount, set_unlimited=None):
-        with self._get_connection() as conn:
+        def _modify(conn):
             cursor = conn.cursor()
             if set_unlimited is not None:
                 cursor.execute("UPDATE credits SET unlimited = ? WHERE user_id = ?", (1 if set_unlimited else 0, user_id))
             else:
                 cursor.execute("UPDATE credits SET balance = MAX(0, balance + ?) WHERE user_id = ?", (amount, user_id))
-            conn.commit()
-            self.add_log("ADMIN_ACTION", "CREDIT_MODIFIED", f"Credits updated for user {user_id}. Amount={amount if set_unlimited is None else 'UNLIMITED'}", user_id)
+            try:
+                self.add_log("ADMIN_ACTION", "CREDIT_MODIFIED", f"Credits updated for user {user_id}. Amount={amount if set_unlimited is None else 'UNLIMITED'}", user_id, conn=conn)
+            except Exception:
+                pass
+                
+        self._run_with_retry(_modify)
 
     # --- BANNING CONTROL ---
     def ban_user(self, user_id, reason):
         now = datetime.datetime.now().isoformat()
-        with self._get_connection() as conn:
+        def _ban(conn):
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET is_banned = 1 WHERE id = ?", (user_id,))
             cursor.execute("INSERT OR REPLACE INTO banned_users (user_id, reason, banned_at) VALUES (?, ?, ?)", (user_id, reason, now))
-            conn.commit()
-            self.add_log("ADMIN_ACTION", "USER_BANNED", f"Banned user {user_id} for: {reason}", user_id)
+            try:
+                self.add_log("ADMIN_ACTION", "USER_BANNED", f"Banned user {user_id} for: {reason}", user_id, conn=conn)
+            except Exception:
+                pass
+                
+        self._run_with_retry(_ban)
 
     def unban_user(self, user_id):
-        with self._get_connection() as conn:
+        def _unban(conn):
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET is_banned = 0 WHERE id = ?", (user_id,))
             cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
-            conn.commit()
-            self.add_log("ADMIN_ACTION", "USER_UNBANNED", f"Unbanned user {user_id}", user_id)
+            try:
+                self.add_log("ADMIN_ACTION", "USER_UNBANNED", f"Unbanned user {user_id}", user_id, conn=conn)
+            except Exception:
+                pass
+                
+        self._run_with_retry(_unban)
 
     def is_banned(self, user_id):
-        with self._get_connection() as conn:
+        def _is_b(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT is_banned FROM users WHERE id = ?", (user_id,))
             row = cursor.fetchone()
             if row and row["is_banned"] == 1:
                 return True
             return False
+        return self._run_with_retry(_is_b)
 
     # --- ADMIN PRIVILEGES ---
     def is_admin(self, user_id):
         if user_id in ADMIN_IDS:
             return True
-        with self._get_connection() as conn:
+        def _is_a(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
             return cursor.fetchone() is not None
+        return self._run_with_retry(_is_a)
 
     def add_admin(self, user_id):
         now = datetime.datetime.now().isoformat()
-        with self._get_connection() as conn:
+        def _add(conn):
             cursor = conn.cursor()
             cursor.execute("INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)", (user_id, now))
-            conn.commit()
-            self.add_log("ADMIN_ACTION", "ADMIN_ADDED", f"Granted admin role to {user_id}", user_id)
+            try:
+                self.add_log("ADMIN_ACTION", "ADMIN_ADDED", f"Granted admin role to {user_id}", user_id, conn=conn)
+            except Exception:
+                pass
+                
+        self._run_with_retry(_add)
 
     def remove_admin(self, user_id):
         if user_id in ADMIN_IDS:
             return False # Cannot remove environment level admins
-        with self._get_connection() as conn:
+        def _remove(conn):
             cursor = conn.cursor()
             cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-            conn.commit()
-            self.add_log("ADMIN_ACTION", "ADMIN_REMOVED", f"Revoked admin role from {user_id}", user_id)
+            try:
+                self.add_log("ADMIN_ACTION", "ADMIN_REMOVED", f"Revoked admin role from {user_id}", user_id, conn=conn)
+            except Exception:
+                pass
             return True
+            
+        return self._run_with_retry(_remove)
 
     # --- RESUME REGISTRY ---
     def save_resume(self, user_id, title, pdf_path, docx_path, model_used, content):
         now = datetime.datetime.now().isoformat()
-        with self._get_connection() as conn:
+        def _save(conn):
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO resumes (user_id, title, file_path_pdf, file_path_docx, model_used, created_at, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (user_id, title, pdf_path, docx_path, model_used, now, content)
             )
-            conn.commit()
-            self.add_log("INFO", "RESUME_GENERATED", f"Generated resume: {title} via model: {model_used}", user_id)
-            return cursor.lastrowid
+            last_id = cursor.lastrowid
+            try:
+                self.add_log("INFO", "RESUME_GENERATED", f"Generated resume: {title} via model: {model_used}", user_id, conn=conn)
+            except Exception:
+                pass
+            return last_id
+            
+        return self._run_with_retry(_save)
 
     def get_user_resumes(self, user_id):
-        with self._get_connection() as conn:
+        def _get(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM resumes WHERE user_id = ? ORDER BY id DESC", (user_id,))
             return [dict(row) for row in cursor.fetchall()]
+        return self._run_with_retry(_get)
 
     # --- CONFIGURATION SETTINGS ---
     def get_setting(self, key, default=None):
-        with self._get_connection() as conn:
+        def _get(conn):
             cursor = conn.cursor()
             cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
             row = cursor.fetchone()
             return row["value"] if row else default
+        return self._run_with_retry(_get)
 
     def set_setting(self, key, value):
-        with self._get_connection() as conn:
+        def _set(conn):
             cursor = conn.cursor()
             cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-            conn.commit()
+        self._run_with_retry(_set)
 
     def get_models(self):
         models_json = self.get_setting("models_list")
@@ -407,9 +497,10 @@ class DBManager:
     # --- STATS REPORTING ---
     def get_dashboard_stats(self):
         now_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-        stats = {}
-        with self._get_connection() as conn:
+        
+        def _get_stats(conn):
             cursor = conn.cursor()
+            stats = {}
             
             # Total Users
             cursor.execute("SELECT COUNT(*) FROM users")
@@ -432,8 +523,6 @@ class DBManager:
             stats["todays_resumes"] = cursor.fetchone()[0]
             
             # Credits Used vs Remaining
-            # Total starting credits per user is 2. plus whatever refer / daily.
-            # We can aggregate total balance
             cursor.execute("SELECT SUM(balance) FROM credits")
             stats["credits_remaining"] = cursor.fetchone()[0] or 0
             
@@ -441,10 +530,12 @@ class DBManager:
             cursor.execute("SELECT COUNT(*) FROM logs WHERE category = 'RESUME_GENERATED'")
             stats["credits_used"] = cursor.fetchone()[0] or 0
             
-        return stats
+            return stats
+
+        return self._run_with_retry(_get_stats)
 
     def get_all_users_for_admin(self):
-        with self._get_connection() as conn:
+        def _get(conn):
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT u.*, c.balance, c.unlimited, b.reason as ban_reason
@@ -454,9 +545,10 @@ class DBManager:
                 ORDER BY u.joined_at DESC
             """)
             return [dict(row) for row in cursor.fetchall()]
+        return self._run_with_retry(_get)
 
     def search_user_by_query(self, query):
-        with self._get_connection() as conn:
+        def _search(conn):
             cursor = conn.cursor()
             if query.isdigit():
                 cursor.execute("""
@@ -476,9 +568,10 @@ class DBManager:
                     WHERE u.username LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?
                 """, (q, q, q))
             return [dict(row) for row in cursor.fetchall()]
+        return self._run_with_retry(_search)
 
     def delete_user_all_data(self, user_id):
-        with self._get_connection() as conn:
+        def _delete(conn):
             cursor = conn.cursor()
             cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
             cursor.execute("DELETE FROM credits WHERE user_id = ?", (user_id,))
@@ -486,5 +579,9 @@ class DBManager:
             cursor.execute("DELETE FROM referrals WHERE referrer_id = ? OR referee_id = ?", (user_id, user_id))
             cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
             cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-            conn.commit()
-            self.add_log("ADMIN_ACTION", "USER_DELETED_ALL", f"Deleted all data for user ID {user_id}", user_id)
+            try:
+                self.add_log("ADMIN_ACTION", "USER_DELETED_ALL", f"Deleted all data for user ID {user_id}", user_id, conn=conn)
+            except Exception:
+                pass
+                
+        self._run_with_retry(_delete)
