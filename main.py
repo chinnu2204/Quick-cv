@@ -82,7 +82,7 @@ async def main():
             async def start_user_polling():
                 logger.info("Starting QuickCV User Bot polling...")
                 await user_dp.start_polling(user_bot_instance)
-            runners.append(start_user_polling())
+            runners.append(start_user_polling)
             initialized_bots.append("UserBot (Active)")
         except Exception as e:
             logger.error(f"Failed to load User Bot instance: {str(e)}")
@@ -97,7 +97,7 @@ async def main():
             async def start_admin_polling():
                 logger.info("Starting QuickCV Admin Panel Bot polling...")
                 await admin_dp.start_polling(admin_bot_instance)
-            runners.append(start_admin_polling())
+            runners.append(start_admin_polling)
             initialized_bots.append("AdminBot (Active)")
         except Exception as e:
             logger.error(f"Failed to load Admin Bot instance: {str(e)}")
@@ -116,7 +116,7 @@ async def main():
             async def start_credit_polling():
                 logger.info("Starting QuickCV Credit & Notification Bot polling...")
                 await credit_dp.start_polling(credit_bot_instance)
-            runners.append(start_credit_polling())
+            runners.append(start_credit_polling)
             initialized_bots.append("CreditBot (Active)")
         except Exception as e:
             logger.error(f"Failed to load Credit Bot instance: {str(e)}")
