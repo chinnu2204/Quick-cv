@@ -3,8 +3,8 @@
 # ====================================================
 
 services:
-  - type: worker
-    name: quickcv-background-bots
+  - type: web
+    name: quickcv-telegram-saas
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
@@ -21,8 +21,5 @@ services:
       - key: ADMIN_IDS
         sync: false
       - key: PORT
-        value: 3000
-    disk:
-      name: sqlite-data
-      mountPath: /data
-      sizeGB: 1
+        value: 10000
+
