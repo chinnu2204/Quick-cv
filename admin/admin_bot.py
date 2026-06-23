@@ -311,9 +311,10 @@ async def callback_adjust_credits(callback: CallbackQuery):
     elif action == "reset":
         # reset to standard 2 credits
         db.modify_credits(target_id, 0, set_unlimited=False)
-        # Reset balance to exactly 2
-        with db._get_connection() as conn:
+        # Reset balance to exactly 2 with retry-safe db wrapper
+        def _reset_balance(conn):
             conn.execute("UPDATE credits SET balance = 2 WHERE user_id = ?", (target_id,))
+        db._run_with_retry(_reset_balance)
         await callback.answer("Reset user balance to 2 credits.", show_alert=True)
     else:
         amt = int(action)

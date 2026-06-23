@@ -1,6 +1,7 @@
 import os
 import uuid
 import datetime
+import logging
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
 from aiogram.types import (
@@ -13,6 +14,7 @@ from database.db_manager import DBManager
 from config.generator import call_opencode_api, create_resume_files
 from config.settings import RESUMES_DIR
 
+logger = logging.getLogger("UserBot")
 router = Router()
 db = DBManager()
 
@@ -86,47 +88,111 @@ async def check_intercept_menu(message: Message, state: FSMContext) -> bool:
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    
-    # Check for referral in deeplinking query
-    ref_referrer_id = None
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1:
-        ref_code = args[1].upper().strip()
-        referrer = db.get_user_by_referral_code(ref_code)
-        if referrer:
-            ref_referrer_id = referrer["id"]
-            
-    # Register/fetch user profile in SQLite
-    user = db.get_or_create_user(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "",
-        first_name=message.from_user.first_name,
-        last_name=message.from_user.last_name or "",
-        referred_by=ref_referrer_id
-    )
-    
-    if db.is_banned(message.from_user.id):
-        await message.reply("Access Revoked: Your account is suspended. Please contact support.")
+    user_id = message.from_user.id if message.from_user else None
+    if not user_id:
+        logger.warning("[START_RECEIVED] Empty from_user structure in start command.")
         return
 
-    welcome_text = (
-        f"👋 Welcome to **QuickCV**, {message.from_user.first_name}!\n\n"
-        "Need a professional, ATS-optimized CV but don't know where to start? "
-        "We've got you covered! Fill out simple details, and our premium tailored AI writes "
-        "and forms a high-impact resume in PDF and DOCX formats instantly.\n\n"
-        "💎 **New User Bonus:** You have been credited **2 Free Credits**!"
-    )
-    
-    if ref_referrer_id:
-        welcome_text += "\n\n🎉 *Registered via unique invitation link!*"
-        # Notify the referrer by credit bot
-        await notify_via_credit_bot(
-            ref_referrer_id, 
-            f"🎉 **Referral Reward Approved!**\n\n+{user['first_name']} joined QuickCV under your code. **+1 Credit** has been added to your profile!"
-        )
+    logger.info(f"[START_RECEIVED] /start received from user_id={user_id} message_text='{message.text}'")
+    db.add_log("INFO", "START_RECEIVED", f"/start received from {user_id}", user_id)
 
-    await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+    try:
+        # Step 1: Cleanup FSM wizards
+        await state.clear()
+
+        # Step 2: Handle deep linking referral
+        ref_referrer_id = None
+        args = message.text.split(maxsplit=1) if message.text else []
+        if len(args) > 1:
+            ref_code = args[1].upper().strip()
+            logger.info(f"[USER_LOOKUP] Locating referral owner code='{ref_code}' for user_id={user_id}")
+            try:
+                referrer = db.get_user_by_referral_code(ref_code)
+                if referrer:
+                    ref_referrer_id = referrer["id"]
+                    logger.info(f"[USER_LOOKUP] Referrer {ref_referrer_id} discovered for user_id={user_id}")
+                else:
+                    logger.info(f"[USER_LOOKUP] Invalid reference code '{ref_code}' for user_id={user_id}")
+            except Exception as rex:
+                logger.error(f"[USER_LOOKUP] Referral code lookup failed: {rex}")
+                db.add_log("ERROR", "REFERRAL_LOOKUP_FAILED", f"Error querying code: {rex}", user_id)
+
+        # Step 3: Register / Retrieve profile in SQLite database
+        first_name = message.from_user.first_name or "User"
+        last_name = message.from_user.last_name or ""
+        username = message.from_user.username or ""
+
+        logger.info(f"[USER_CREATED] Database profile update initiated for user_id={user_id}")
+        try:
+            user = db.get_or_create_user(
+                user_id=user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                referred_by=ref_referrer_id
+            )
+            logger.info(f"[USER_CREATED] Resolved user database record successfully inside start handler.")
+        except Exception as uex:
+            logger.error(f"[USER_CREATED] DB user creation failed for user_id={user_id}: {uex}")
+            db.add_log("ERROR", "USER_DATABASE_CREATION_FAILED", f"Database create fail: {uex}", user_id)
+            raise uex
+
+        # Verify ban check safely
+        try:
+            banned = db.is_banned(user_id)
+        except Exception as bex:
+            logger.error(f"Ban check query failed: {bex}")
+            banned = False
+
+        if banned:
+            logger.warning(f"Banned user_id={user_id} attempted access. Terminated.")
+            await message.reply("Access Revoked: Your account is suspended. Please contact support.")
+            return
+
+        # Step 4: Referral rewards notification via helper bots
+        if ref_referrer_id:
+            logger.info(f"[REFERRAL_PROCESSED] Processing referral bonus. referrer={ref_referrer_id}, referee={user_id}")
+            try:
+                ref_user_name = user.get("first_name", first_name)
+                # Strip markdown special formatting from name to be safe
+                safe_ref_name = ref_user_name.replace("*", "").replace("_", "").replace("`", "")
+                await notify_via_credit_bot(
+                    ref_referrer_id, 
+                    f"🎉 **Referral Reward Approved!**\n\n+{safe_ref_name} joined QuickCV under your code. **+1 Credit** has been added to your profile!"
+                )
+                logger.info(f"[REFERRAL_PROCESSED] Sent invite bonus notice successfully to referrer={ref_referrer_id}")
+            except Exception as nex:
+                logger.warning(f"[REFERRAL_PROCESSED] Non-blocking referral notification failed: {nex}")
+
+        # Step 5: Welcome message output
+        safe_first_name = first_name.replace("*", "").replace("_", "").replace("`", "")
+        welcome_text = (
+            f"👋 Welcome to **QuickCV**, {safe_first_name}!\n\n"
+            "Need a professional, ATS-optimized CV but don't know where to start? "
+            "We've got you covered! Fill out simple details, and our premium tailored AI writes "
+            "and forms a high-impact resume in PDF and DOCX formats instantly.\n\n"
+            "💎 **New User Bonus:** You have been credited **2 Free Credits**!"
+        )
+        
+        if ref_referrer_id:
+            welcome_text += "\n\n🎉 *Registered via unique invitation link!*"
+
+        logger.info(f"[WELCOME_SENT] Sending primary menu payload to user_id={user_id}")
+        await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        logger.info(f"[WELCOME_SENT] Output welcome text successfully inside chat_id={user_id}")
+        db.add_log("INFO", "WELCOME_SENT", "Successfully rendered start welcome text.", user_id)
+
+    except Exception as general_err:
+        logger.critical(f"UNHANDLED ERROR inside cmd_start handler: {general_err}", exc_info=True)
+        try:
+            db.add_log("CRITICAL", "START_HANDLER_FAILED", f"Critical handler error: {general_err}", user_id)
+        except:
+            pass
+        # Reliable fallback response
+        try:
+            await message.answer("⚠️ An internal error occurred. Please try again.", reply_markup=get_main_keyboard())
+        except Exception as fex:
+            logger.critical(f"Could not output starting fallback to chat {user_id}: {fex}")
 
 @router.message(Command("cancel"))
 @router.message(F.text == "❌ Cancel")
@@ -512,9 +578,17 @@ async def state_hobbies(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("down_pdf_"))
 async def back_down_pdf(callback: CallbackQuery):
     cv_id = callback.data.split("_")[-1]
-    # Fetch resume record
-    with db._get_connection() as conn:
-        row = conn.execute("SELECT * FROM resumes WHERE id = ?", (cv_id,)).fetchone()
+    # Fetch resume record with retry-safe db wrapper
+    try:
+        def _get_pdf(conn):
+            row = conn.execute("SELECT * FROM resumes WHERE id = ?", (cv_id,)).fetchone()
+            return dict(row) if row else None
+        row = db._run_with_retry(_get_pdf)
+    except Exception as d_err:
+        logger.error(f"Callback error fetching PDF resume: {d_err}")
+        await callback.answer("⚠️ Database busy. Please try again.", show_alert=True)
+        return
+
     if row:
         if row["user_id"] != callback.from_user.id:
             await callback.answer("Access Denied: You do not own this document.", show_alert=True)
@@ -522,10 +596,13 @@ async def back_down_pdf(callback: CallbackQuery):
         pdf_path = os.path.join(RESUMES_DIR, row["file_path_pdf"])
         if os.path.exists(pdf_path):
             await callback.answer("Uploading PDF File...")
-            await callback.message.reply_document(
-                document=FSInputFile(pdf_path),
-                caption=f"📄 **Redownloaded [PDF]:** {row['title']}"
-            )
+            try:
+                await callback.message.reply_document(
+                    document=FSInputFile(pdf_path),
+                    caption=f"📄 **Redownloaded [PDF]:** {row['title']}"
+                )
+            except Exception as tr_err:
+                logger.error(f"Failed to deliver PDF document: {tr_err}")
         else:
             await callback.answer("Error: Document file missing on disk.", show_alert=True)
     else:
@@ -534,8 +611,17 @@ async def back_down_pdf(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("down_docx_"))
 async def back_down_docx(callback: CallbackQuery):
     cv_id = callback.data.split("_")[-1]
-    with db._get_connection() as conn:
-        row = conn.execute("SELECT * FROM resumes WHERE id = ?", (cv_id,)).fetchone()
+    # Fetch resume record with retry-safe db wrapper
+    try:
+        def _get_docx(conn):
+            row = conn.execute("SELECT * FROM resumes WHERE id = ?", (cv_id,)).fetchone()
+            return dict(row) if row else None
+        row = db._run_with_retry(_get_docx)
+    except Exception as d_err:
+        logger.error(f"Callback error fetching DOCX resume: {d_err}")
+        await callback.answer("⚠️ Database busy. Please try again.", show_alert=True)
+        return
+
     if row:
         if row["user_id"] != callback.from_user.id:
             await callback.answer("Access Denied: You do not own this document.", show_alert=True)
@@ -543,10 +629,13 @@ async def back_down_docx(callback: CallbackQuery):
         docx_path = os.path.join(RESUMES_DIR, row["file_path_docx"])
         if os.path.exists(docx_path):
             await callback.answer("Uploading DOCX File...")
-            await callback.message.reply_document(
-                document=FSInputFile(docx_path),
-                caption=f"📝 **Redownloaded [Word DOCX]:** {row['title']}"
-            )
+            try:
+                await callback.message.reply_document(
+                    document=FSInputFile(docx_path),
+                    caption=f"📝 **Redownloaded [Word DOCX]:** {row['title']}"
+                )
+            except Exception as tr_err:
+                logger.error(f"Failed to deliver DOCX document: {tr_err}")
         else:
             await callback.answer("Error: Document file missing on disk.", show_alert=True)
     else:
@@ -555,22 +644,38 @@ async def back_down_docx(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("del_cv_"))
 async def back_del_cv(callback: CallbackQuery):
     cv_id = callback.data.split("_")[-1]
-    with db._get_connection() as conn:
-        cursor = conn.cursor()
-        row = cursor.execute("SELECT * FROM resumes WHERE id = ?", (cv_id,)).fetchone()
-        if row:
+    
+    try:
+        def _del_resume(conn):
+            row = conn.execute("SELECT * FROM resumes WHERE id = ?", (cv_id,)).fetchone()
+            if not row:
+                return "NOT_FOUND", None
             if row["user_id"] != callback.from_user.id:
-                await callback.answer("Access Denied: You do not own this document.", show_alert=True)
-                return
-            # Delete physical files
-            try:
-                os.remove(os.path.join(RESUMES_DIR, row["file_path_pdf"]))
-                os.remove(os.path.join(RESUMES_DIR, row["file_path_docx"]))
-            except:
-                pass
-            cursor.execute("DELETE FROM resumes WHERE id = ?", (cv_id,))
-            conn.commit()
+                return "DENIED", None
+            
+            # Perform SQLite deletion
+            conn.execute("DELETE FROM resumes WHERE id = ?", (cv_id,))
+            return "OK", dict(row)
+            
+        status, row = db._run_with_retry(_del_resume)
+    except Exception as d_err:
+        logger.error(f"Callback error deleting resume: {d_err}")
+        await callback.answer("⚠️ Database busy. Please try again.", show_alert=True)
+        return
+
+    if status == "OK":
+        # Delete physical files
+        try:
+            os.remove(os.path.join(RESUMES_DIR, row["file_path_pdf"]))
+            os.remove(os.path.join(RESUMES_DIR, row["file_path_docx"]))
+        except:
+            pass
+        try:
             await callback.message.delete()
-            await callback.answer("Resume document deleted permanently.")
-        else:
-            await callback.answer("Resume record not found.", show_alert=True)
+        except:
+            pass
+        await callback.answer("Resume document deleted permanently.")
+    elif status == "DENIED":
+        await callback.answer("Access Denied: You do not own this document.", show_alert=True)
+    else:
+        await callback.answer("Resume record not found.", show_alert=True)
