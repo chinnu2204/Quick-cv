@@ -1,0 +1,8 @@
+{
+  "name": "QuickCV",
+  "description": "Multi-bot Telegram SaaS for modern AI-powered resume generation (User, Admin and Credit bot suite)",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

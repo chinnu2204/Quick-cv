@@ -1,0 +1,28 @@
+# ====================================================
+# Render.com Blueprint Configuration for QuickCV
+# ====================================================
+
+services:
+  - type: worker
+    name: quickcv-background-bots
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    runtime: python-3.11.0 # Or appropriate python-3.11+ environment
+    envVars:
+      - key: USER_BOT_TOKEN
+        sync: false
+      - key: ADMIN_BOT_TOKEN
+        sync: false
+      - key: CREDIT_BOT_TOKEN
+        sync: false
+      - key: OPENCODE_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: PORT
+        value: 3000
+    disk:
+      name: sqlite-data
+      mountPath: /data
+      sizeGB: 1
